@@ -1,0 +1,88 @@
+name: smoke-object-separator
+
+# Smoke run: proves the whole path end-to-end on a 500 train / 100 val
+# subset -- data prep, training (with a real interrupt + --resume in the
+# middle), ONNX export, and the layer-split demo (original / viz / RGBA
+# cutouts). Accuracy is NOT the goal here; mAP will be near zero.
+on:
+  workflow_dispatch:
+    inputs:
+      epochs_total:
+        description: "Total epochs after resume (run 1 stops at 2)"
+        required: true
+        default: "5"
+      batch:
+        description: "Batch size"
+        required: true
+        default: "8"
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies (CPU torch)
+        run: |
+          pip install torch==2.3.1 --index-url https://download.pytorch.org/whl/cpu
+          pip install onnx==1.16.1 onnxruntime==1.18.0 pillow==10.4.0 numpy==1.26.4
+
+      - name: Cache smoke dataset
+        uses: actions/cache@v4
+        with:
+          path: data
+          key: coco-seg-smoke-v1
+
+      - name: Prepare smoke data (COCO, class-agnostic)
+        run: python data_prep.py --smoke
+
+      - name: Train run 1 (epochs 1-2, writes last.pt)
+        run: |
+          set -o pipefail
+          mkdir -p runs
+          python -u train.py --epochs 2 --batch ${{ inputs.batch }} \
+            --eval-limit 100 2>&1 | tee runs/train1.log
+
+      - name: Train run 2 (resume to total epochs -- proves --resume)
+        run: |
+          set -o pipefail
+          python -u train.py --epochs ${{ inputs.epochs_total }} \
+            --batch ${{ inputs.batch }} --eval-limit 100 --resume \
+            2>&1 | tee runs/train2.log
+          grep -q "Resumed from" runs/train2.log && echo "RESUME VERIFIED"
+
+      - name: Export ONNX
+        run: |
+          set -o pipefail
+          python export.py 2>&1 | tee -a runs/train2.log
+
+      - name: Layer-split demo on sample val images
+        run: |
+          mkdir -p samples_in
+          ls data/images/val/*.jpg | head -5 | xargs -I{} cp {} samples_in/
+          python predict.py --model runs/best.onnx --src samples_in \
+            --out samples_out --conf 0.25
+
+      - name: Collect artifact files
+        run: |
+          mkdir -p artifact_out
+          cp runs/best.onnx artifact_out/
+          cp runs/best.pt artifact_out/ || true
+          cp runs/last.pt artifact_out/ || true
+          cp runs/metrics.json artifact_out/
+          cp runs/train1.log runs/train2.log artifact_out/
+          cp data/manifest.json artifact_out/ || true
+          cp -r samples_out artifact_out/samples_out
+          find artifact_out -type f | sort
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: object-separator-smoke
+          path: artifact_out/
+          if-no-files-found: error

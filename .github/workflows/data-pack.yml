@@ -1,0 +1,42 @@
+name: data-pack-object-separator
+
+# One-time (per dataset version) job: builds the FULL class-agnostic COCO
+# dataset on the runner (118k images -- too slow to redo inside every
+# training job) and publishes it as split tar parts on release `data-full`,
+# the same pattern as phone-detector's data-v2 pack.
+on:
+  workflow_dispatch:
+
+jobs:
+  pack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies (data_prep needs only pillow/numpy-free stdlib + pillow)
+        run: pip install pillow==10.4.0
+
+      - name: Prepare FULL dataset (COCO, class-agnostic)
+        run: python data_prep.py --full
+
+      - name: Pack and publish release data-full
+        run: |
+          mkdir -p pack
+          tar -cf - data | split -b 1900M - pack/data.tar.part-
+          ls -la pack/
+          gh release view data-full > /dev/null 2>&1 || \
+            gh release create data-full --title "Object separator full dataset" \
+              --notes "Full class-agnostic COCO instance-seg pack (images + polygon labels + manifest). Built by .github/workflows/data-pack.yml."
+          gh release upload data-full pack/data.tar.part-* --clobber
+          gh release upload data-full data/manifest.json --clobber
+          echo "pack published"

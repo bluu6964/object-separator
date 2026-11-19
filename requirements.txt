@@ -1,0 +1,6 @@
+# torch is installed separately from the CPU wheel index:
+#   pip install torch==2.3.1 --index-url https://download.pytorch.org/whl/cpu
+onnx==1.16.1
+onnxruntime==1.18.0
+pillow==10.4.0
+numpy==1.26.4

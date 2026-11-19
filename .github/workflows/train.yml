@@ -1,0 +1,101 @@
+name: train-object-separator
+
+# Chained full training (same pattern as phone-detector v2): each dispatch
+# restores last.pt/best.pt from the `ckpt-v1` release, trains toward the
+# TOTAL target epochs (train.py --resume semantics), then uploads the
+# updated checkpoints back. Re-dispatching continues where the last job
+# stopped. Requires the dataset pack in release `data-full` (built by
+# data-pack.yml).
+on:
+  workflow_dispatch:
+    inputs:
+      epochs:
+        description: "TOTAL target epochs (not additional)"
+        required: true
+        default: "30"
+      batch:
+        description: "Batch size"
+        required: true
+        default: "8"
+      probe:
+        description: "Timing probe only: 300 steps, no checkpoints written"
+        type: boolean
+        default: false
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies (CPU torch)
+        run: |
+          pip install torch==2.3.1 --index-url https://download.pytorch.org/whl/cpu
+          pip install pillow==10.4.0 numpy==1.26.4
+
+      - name: Download dataset pack (release data-full)
+        run: |
+          mkdir -p pack
+          gh release download data-full --pattern 'data.tar.part-*' --dir pack
+          cat pack/data.tar.part-* | tar -xf - -C .
+          rm -rf pack
+          test -f data/manifest.json
+          echo "train images: $(ls data/images/train | wc -l)"
+          echo "val images:   $(ls data/images/val | wc -l)"
+          cat data/manifest.json
+
+      - name: Restore checkpoint from release ckpt-v1 (if any)
+        if: ${{ !inputs.probe }}
+        run: |
+          mkdir -p runs
+          gh release download ckpt-v1 --pattern 'last.pt' --dir runs || echo "no last.pt yet (fresh start)"
+          gh release download ckpt-v1 --pattern 'best.pt' --dir runs || echo "no best.pt yet (fresh start)"
+          ls -la runs || true
+
+      - name: Timing probe (300 steps)
+        if: ${{ inputs.probe }}
+        run: |
+          python -u train.py --epochs ${{ inputs.epochs }} \
+            --batch ${{ inputs.batch }} --max-steps 300 \
+            --workers 4 --out runs 2>&1 | tee train.log
+
+      - name: Train toward target epochs (resumable)
+        if: ${{ !inputs.probe }}
+        run: |
+          python -u train.py --epochs ${{ inputs.epochs }} \
+            --batch ${{ inputs.batch }} --resume \
+            --workers 4 --out runs 2>&1 | tee train.log
+
+      - name: Upload checkpoints back to release ckpt-v1
+        if: ${{ always() && !inputs.probe }}
+        run: |
+          if [ -f runs/last.pt ]; then
+            gh release view ckpt-v1 > /dev/null 2>&1 || \
+              gh release create ckpt-v1 --title "Object separator checkpoints" \
+                --notes "Rolling last.pt / best.pt for chained train runs. Managed by .github/workflows/train.yml."
+            gh release upload ckpt-v1 runs/last.pt --clobber
+            [ -f runs/best.pt ] && gh release upload ckpt-v1 runs/best.pt --clobber || true
+            echo "checkpoints uploaded"
+          else
+            echo "no runs/last.pt to upload"
+          fi
+
+      - name: Upload run artifact (metrics + log)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: object-separator-run
+          path: |
+            runs/metrics.json
+            train.log
+          if-no-files-found: warn
