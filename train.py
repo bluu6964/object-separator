@@ -51,6 +51,63 @@ def letterbox_params(w, h, size=None):
     return scale, dx, dy, nw, nh
 
 
+def rasterize_instances(label, w, h):
+    """Letterbox-transform a label's instances: returns (boxes, masks)
+    with boxes [x1,y1,x2,y2] in canvas coords and masks a list of PIL
+    'L' images (IMG_SIZE x IMG_SIZE, values 0/1). Instances whose box
+    is < 2px on a side or whose rasterized mask is empty are dropped.
+    This is the ONLY place polygons are drawn -- build_cache.py runs it
+    once per image so training epochs never repeat it."""
+    scale, dx, dy, nw, nh = letterbox_params(w, h)
+    boxes = []
+    mask_imgs = []
+    for inst in label["instances"]:
+        bx, by, bw, bh = inst["bbox"]
+        x1, y1 = bx * scale + dx, by * scale + dy
+        x2, y2 = (bx + bw) * scale + dx, (by + bh) * scale + dy
+        if x2 - x1 < 2 or y2 - y1 < 2:
+            continue
+        m = Image.new("L", (IMG_SIZE, IMG_SIZE), 0)
+        draw = ImageDraw.Draw(m)
+        for poly in inst["poly"]:
+            pts = [(poly[i] * scale + dx, poly[i + 1] * scale + dy)
+                   for i in range(0, len(poly) - 1, 2)]
+            if len(pts) >= 3:
+                draw.polygon(pts, fill=1)
+        if np.asarray(m).sum() == 0:
+            continue
+        boxes.append([x1, y1, x2, y2])
+        mask_imgs.append(m)
+    return boxes, mask_imgs
+
+
+def cache_dir_for(root):
+    """Per-image rasterized-mask cache for the CURRENT IMG_SIZE:
+    <root>/cache-<IMG_SIZE>/<split>/<stem>.npz (built by
+    build_cache.py). The cache stores the PRE-augmentation instances
+    (letterboxed boxes + bitpacked masks), so the dataset's random
+    augmentation still runs per epoch on the loaded tensors/PIL
+    images exactly as before -- only the polygon drawing is saved."""
+    return os.path.join(root, f"cache-{IMG_SIZE}")
+
+
+def pack_mask_imgs(mask_imgs):
+    """Bitpack PIL 'L' 0/1 masks -> uint8 [M, IMG_SIZE*IMG_SIZE//8]."""
+    if not mask_imgs:
+        return np.zeros((0, IMG_SIZE * IMG_SIZE // 8), dtype=np.uint8)
+    arr = np.stack([np.asarray(m, dtype=np.uint8) for m in mask_imgs])
+    return np.packbits(arr.reshape(len(mask_imgs), -1), axis=1)
+
+
+def unpack_mask_imgs(packed):
+    """Inverse of pack_mask_imgs: -> list of PIL 'L' images (0/1)."""
+    if len(packed) == 0:
+        return []
+    bits = np.unpackbits(packed, axis=1)[:, :IMG_SIZE * IMG_SIZE]
+    bits = bits.reshape(-1, IMG_SIZE, IMG_SIZE)
+    return [Image.fromarray(bits[i]) for i in range(len(bits))]
+
+
 class SegDataset(Dataset):
     """Items: (image tensor [3,640,640] in [0,1], boxes [M,4] xyxy in
     canvas coords, masks [M,160,160] float in canvas/proto coords)."""
@@ -58,6 +115,8 @@ class SegDataset(Dataset):
     def __init__(self, root, split, augment=False, limit=None, seed=42):
         self.img_dir = os.path.join(root, "images", split)
         self.lbl_dir = os.path.join(root, "labels", split)
+        self.cache_dir = os.path.join(cache_dir_for(root), split)
+        self.use_cache = True
         self.files = sorted(f for f in os.listdir(self.img_dir)
                             if f.endswith(".jpg"))
         if limit:
@@ -75,37 +134,43 @@ class SegDataset(Dataset):
         with open(os.path.join(self.lbl_dir, stem + ".json")) as f:
             return json.load(f)
 
+    def _load_cache(self, name):
+        """(boxes, mask_imgs) from the rasterization cache, or None if
+        this image has no (valid, current-size) cache entry."""
+        stem = os.path.splitext(name)[0]
+        path = os.path.join(self.cache_dir, stem + ".npz")
+        if not os.path.exists(path):
+            return None
+        try:
+            with np.load(path) as z:
+                if int(z["img_size"]) != IMG_SIZE:
+                    return None
+                boxes = z["boxes"].astype(np.float64).tolist()
+                mask_imgs = unpack_mask_imgs(z["masks"])
+        except Exception:  # noqa: BLE001 -- a corrupt entry must not
+            return None       # kill training; rasterize instead
+        if len(boxes) != len(mask_imgs):
+            return None
+        return boxes, mask_imgs
+
     def __getitem__(self, idx):
         name = self.files[idx]
         img = Image.open(os.path.join(self.img_dir, name)).convert("RGB")
         w, h = img.size
-        label = self._load_label(name)
         scale, dx, dy, nw, nh = letterbox_params(w, h)
         # Letterbox the image.
         canvas = Image.new("RGB", (IMG_SIZE, IMG_SIZE),
                            (PAD_VALUE, PAD_VALUE, PAD_VALUE))
         canvas.paste(img.resize((nw, nh), Image.BILINEAR), (dx, dy))
         img = canvas
-        # Transform instances to canvas coords; rasterize masks at 640.
-        boxes = []
-        mask_imgs = []
-        for inst in label["instances"]:
-            bx, by, bw, bh = inst["bbox"]
-            x1, y1 = bx * scale + dx, by * scale + dy
-            x2, y2 = (bx + bw) * scale + dx, (by + bh) * scale + dy
-            if x2 - x1 < 2 or y2 - y1 < 2:
-                continue
-            m = Image.new("L", (IMG_SIZE, IMG_SIZE), 0)
-            draw = ImageDraw.Draw(m)
-            for poly in inst["poly"]:
-                pts = [(poly[i] * scale + dx, poly[i + 1] * scale + dy)
-                       for i in range(0, len(poly) - 1, 2)]
-                if len(pts) >= 3:
-                    draw.polygon(pts, fill=1)
-            if np.asarray(m).sum() == 0:
-                continue
-            boxes.append([x1, y1, x2, y2])
-            mask_imgs.append(m)
+        # Instances in canvas coords: from the rasterization cache if
+        # present (built once by build_cache.py), else drawn now.
+        cached = self._load_cache(name) if self.use_cache else None
+        if cached is not None:
+            boxes, mask_imgs = cached
+        else:
+            boxes, mask_imgs = rasterize_instances(self._load_label(name),
+                                                   w, h)
         rng = self.rng
         if self.augment:
             if rng.random() < 0.5:  # horizontal flip (image + masks + boxes)
@@ -159,8 +224,25 @@ def collate(batch):
 
 
 def build_targets(boxes_list, device):
-    """Per scale: obj [B,H,W], box [B,4,H,W] (stride units), positive
-    mask [B,H,W], instance index [B,H,W] (-1 = none)."""
+    """FCOS-style assignment, vectorized with tensor ops (the original
+    per-cell Python loops cost ~0.10 s/image on the main process --
+    more than the data loading itself -- and starved the GPU).
+
+    Returns (targets, mask_cells):
+      targets: per scale (obj [B,H,W], box [B,4,H,W] stride units,
+               pos [B,H,W] bool, inst [B,H,W] long, -1 = none)
+      mask_cells: per image, per instance, the <= MASK_CELLS_PER_INST
+               positive cells nearest the instance centre as
+               (scale_idx, gy, gx) tuples -- the exact selection the
+               mask loss used to re-search every step (3 nonzero +
+               sort per instance), precomputed here with ONE device->
+               host transfer per image.
+
+    Assignment semantics are IDENTICAL to the loop version (proven by
+    equiv_check.py): a cell belongs to the smallest-area instance
+    whose box contains the cell centre, first instance wins ties; at
+    stride 8 an instance whose centre cell is still unclaimed claims
+    it (lowest instance index wins a shared centre cell)."""
     targets = []
     for si, stride in enumerate(STRIDES):
         g = IMG_SIZE // stride
@@ -169,48 +251,108 @@ def build_targets(boxes_list, device):
         box = torch.zeros((b, 4, g, g), device=device)
         pos = torch.zeros((b, g, g), dtype=torch.bool, device=device)
         inst = torch.full((b, g, g), -1, dtype=torch.long, device=device)
+        centres = (torch.arange(g, device=device, dtype=torch.float32)
+                   + 0.5) * stride
         for i, boxes in enumerate(boxes_list):
             if len(boxes) == 0:
                 continue
-            boxes = boxes.to(device)
-            areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
-            claimed = {}
-            for bi in range(len(boxes)):
-                x1, y1, x2, y2 = boxes[bi].tolist()
-                gx1 = max(0, int(math.floor(x1 / stride)))
-                gy1 = max(0, int(math.floor(y1 / stride)))
-                gx2 = min(g - 1, int(math.floor((x2 - 1e-6) / stride)))
-                gy2 = min(g - 1, int(math.floor((y2 - 1e-6) / stride)))
-                for gy in range(gy1, gy2 + 1):
-                    for gx in range(gx1, gx2 + 1):
-                        cx, cy = (gx + 0.5) * stride, (gy + 0.5) * stride
-                        if x1 <= cx < x2 and y1 <= cy < y2:
-                            key = (gy, gx)
-                            if key not in claimed or areas[bi] < claimed[key][0]:
-                                claimed[key] = (areas[bi], bi, cx, cy)
-            if stride == STRIDES[0]:
-                for bi in range(len(boxes)):
-                    x1, y1, x2, y2 = boxes[bi].tolist()
-                    gx = min(g - 1, max(0, int(((x1 + x2) / 2) / stride)))
-                    gy = min(g - 1, max(0, int(((y1 + y2) / 2) / stride)))
-                    key = (gy, gx)
-                    if key not in claimed:
-                        claimed[key] = (areas[bi], bi,
-                                        (gx + 0.5) * stride, (gy + 0.5) * stride)
-            for (gy, gx), (_, bi, cx, cy) in claimed.items():
-                x1, y1, x2, y2 = boxes[bi].tolist()
-                obj[i, gy, gx] = 1.0
-                pos[i, gy, gx] = True
-                inst[i, gy, gx] = bi
-                box[i, 0, gy, gx] = (cx - x1) / stride
-                box[i, 1, gy, gx] = (cy - y1) / stride
-                box[i, 2, gy, gx] = (x2 - cx) / stride
-                box[i, 3, gy, gx] = (y2 - cy) / stride
+            bx = boxes.to(device=device, dtype=torch.float32)
+            x1, y1, x2, y2 = bx[:, 0], bx[:, 1], bx[:, 2], bx[:, 3]
+            areas = (x2 - x1) * (y2 - y1)
+            inside_x = ((centres[None, :] >= x1[:, None])
+                        & (centres[None, :] < x2[:, None]))   # [M,g]
+            inside_y = ((centres[None, :] >= y1[:, None])
+                        & (centres[None, :] < y2[:, None]))   # [M,g]
+            inside = inside_y[:, :, None] & inside_x[:, None, :]
+            masked = areas.view(-1, 1, 1).expand_as(inside).masked_fill(
+                ~inside, float("inf"))
+            best_area, best_inst = masked.min(dim=0)
+            p = best_area < float("inf")
+            if si == 0:
+                # Centre-cell fallback (stride 8): claim the centre
+                # cell if unclaimed; lowest instance index wins.
+                m = bx.shape[0]
+                gcx = (((x1.double() + x2.double()) * 0.5)
+                       / stride).long().clamp(0, g - 1)
+                gcy = (((y1.double() + y2.double()) * 0.5)
+                       / stride).long().clamp(0, g - 1)
+                fb = torch.full((g * g,), m, dtype=torch.long,
+                                device=device)
+                fb.scatter_reduce_(
+                    0, gcy * g + gcx,
+                    torch.arange(m, device=device), reduce="amin",
+                    include_self=True)
+                claim = (~p) & (fb.view(g, g) < m)
+                best_inst = torch.where(claim, fb.view(g, g), best_inst)
+                p = p | claim
+            if bool(p.any()):
+                safe = best_inst.clamp(min=0)
+                cxg = centres[None, :].expand(g, g)
+                cyg = centres[:, None].expand(g, g)
+                bt = torch.stack([(cxg - bx[safe, 0]) / stride,
+                                  (cyg - bx[safe, 1]) / stride,
+                                  (bx[safe, 2] - cxg) / stride,
+                                  (bx[safe, 3] - cyg) / stride])
+                box[i] = torch.where(p[None], bt, box[i])
+                obj[i] = p.float()
+                pos[i] = p
+                inst[i] = torch.where(p, best_inst, inst[i])
         targets.append((obj, box, pos, inst))
-    return targets
+
+    # ---- mask-loss cell selection (was: per instance, per scale,
+    # nonzero + tolist + sort inside compute_loss, every step) -------
+    mask_cells = []
+    for i, boxes in enumerate(boxes_list):
+        m = len(boxes)
+        per_inst = [[] for _ in range(m)]
+        if m:
+            bx = boxes.to(device=device, dtype=torch.float64)
+            ccx = (bx[:, 0] + bx[:, 2]) * 0.5
+            ccy = (bx[:, 1] + bx[:, 3]) * 0.5
+            rec = [[], [], [], []]  # inst, si, gy, gx (collection order:
+            dists = []              # scale asc, then row-major per scale)
+            for si, stride in enumerate(STRIDES):
+                inst_map = targets[si][3][i]
+                ys, xs = torch.nonzero(inst_map >= 0, as_tuple=True)
+                if len(ys) == 0:
+                    continue
+                ids = inst_map[ys, xs]
+                d = (((xs.double() + 0.5) * stride - ccx[ids]) ** 2
+                     + ((ys.double() + 0.5) * stride - ccy[ids]) ** 2)
+                rec[0].append(ids)
+                rec[1].append(torch.full_like(ids, si))
+                rec[2].append(ys)
+                rec[3].append(xs)
+                dists.append(d)
+            if rec[0]:
+                ids = torch.cat(rec[0])
+                sis = torch.cat(rec[1])
+                gys = torch.cat(rec[2])
+                gxs = torch.cat(rec[3])
+                d = torch.cat(dists)
+                o1 = torch.argsort(d, stable=True)
+                ids, sis, gys, gxs = ids[o1], sis[o1], gys[o1], gxs[o1]
+                o2 = torch.argsort(ids, stable=True)
+                ids_l = ids[o2].tolist()
+                sis_l = sis[o2].tolist()
+                gys_l = gys[o2].tolist()
+                gxs_l = gxs[o2].tolist()
+                counts = [0] * m
+                for k in range(len(ids_l)):
+                    mm = ids_l[k]
+                    if counts[mm] < MASK_CELLS_PER_INST:
+                        per_inst[mm].append((sis_l[k], gys_l[k], gxs_l[k]))
+                        counts[mm] += 1
+        mask_cells.append(per_inst)
+    return targets, mask_cells
 
 
-def compute_loss(outputs, protos, targets, boxes_list, masks_list):
+def compute_loss(outputs, protos, targets, boxes_list, masks_list,
+                 mask_cells=None):
+    """mask_cells: optional precomputed per-image/per-instance mask
+    cell selection from build_targets (list of (si, gy, gx) tuples).
+    When None, the selection is searched here exactly as before --
+    same cells, same loss either way (proven by equiv_check.py)."""
     total_obj = 0.0
     total_box = 0.0
     total_iou = 0.0
@@ -259,22 +401,26 @@ def compute_loss(outputs, protos, targets, boxes_list, masks_list):
             i, protos[i].reshape(PROTO_K, -1))              # [K, 160*160]
         bc = boxes.to(protos.device)
         for m in range(len(boxes)):
-            cells = []  # (dist_to_centre, scale_idx, gy, gx)
             x1, y1, x2, y2 = bc[m].tolist()
-            ccx, ccy = (x1 + x2) / 2, (y1 + y2) / 2
-            for si, stride in enumerate(STRIDES):
-                inst_map = targets[si][3][i]
-                ys, xs = torch.nonzero(inst_map == m, as_tuple=True)
-                for gy, gx in zip(ys.tolist(), xs.tolist()):
-                    d = ((gx + 0.5) * stride - ccx) ** 2 + ((gy + 0.5) * stride - ccy) ** 2
-                    cells.append((d, si, gy, gx))
+            if mask_cells is not None:
+                cells = mask_cells[i][m]  # [(si, gy, gx)], precomputed
+            else:
+                raw = []  # (dist_to_centre, scale_idx, gy, gx)
+                ccx, ccy = (x1 + x2) / 2, (y1 + y2) / 2
+                for si, stride in enumerate(STRIDES):
+                    inst_map = targets[si][3][i]
+                    ys, xs = torch.nonzero(inst_map == m, as_tuple=True)
+                    for gy, gx in zip(ys.tolist(), xs.tolist()):
+                        d = ((gx + 0.5) * stride - ccx) ** 2 + ((gy + 0.5) * stride - ccy) ** 2
+                        raw.append((d, si, gy, gx))
+                raw.sort(key=lambda t: t[0])
+                cells = [(si, gy, gx)
+                         for (_, si, gy, gx) in raw[:MASK_CELLS_PER_INST]]
             if not cells:
                 continue
-            cells.sort(key=lambda t: t[0])
-            cells = cells[:MASK_CELLS_PER_INST]
             coeffs = torch.stack([
                 outputs[si][i, 5:5 + PROTO_K, gy, gx]
-                for (_, si, gy, gx) in cells])              # [n,K]
+                for (si, gy, gx) in cells])                 # [n,K]
             logits = (coeffs @ proto_flat).reshape(
                 -1, PROTO_SIZE, PROTO_SIZE)                 # [n,160,160]
             s = PROTO_SIZE / IMG_SIZE
@@ -445,11 +591,12 @@ def main():
                                memory_format=torch.channels_last)
             else:
                 imgs = imgs.to(device)
-            targets = build_targets(boxes, device)
+            targets, mask_cells = build_targets(boxes, device)
             with torch.autocast(device_type=device.type, enabled=use_amp):
                 outs, protos = model(imgs)
                 loss, lo, lb, li, lm, _ = compute_loss(
-                    outs, protos, targets, boxes, masks)
+                    outs, protos, targets, boxes, masks,
+                    mask_cells=mask_cells)
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.unscale_(opt)

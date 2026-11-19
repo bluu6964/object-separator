@@ -2,10 +2,15 @@ name: data-pack-object-separator
 
 # One-time (per dataset version) job: builds the Option C subset of the
 # class-agnostic COCO dataset on the runner (40,000 train + 2,000 val
-# images, fixed seed 42 -- see data_prep.py) and publishes it as split
-# tar parts on release `data-coco-seg-40k`, the same pattern as
-# phone-detector's data-v2 pack. The Colab notebook downloads this pack
-# instead of re-staging COCO inside every session.
+# images, fixed seed 42 -- see data_prep.py), pre-rasterizes every
+# instance mask ONCE into data/cache-512 (build_cache.py -- without
+# it, training re-draws every polygon on every epoch and the GPU
+# starves), and publishes split tar parts + a pack-manifest.json
+# (per-part byte size + md5, so the Colab download cell can verify
+# each part and re-fetch a truncated one) on release
+# `data-coco-seg-40k`, the same pattern as phone-detector's data-v2
+# pack. The Colab notebook downloads this pack instead of re-staging
+# COCO inside every session.
 on:
   workflow_dispatch:
 
@@ -25,8 +30,11 @@ jobs:
           python-version: "3.11"
           cache: pip
 
-      - name: Install dependencies (data_prep needs only pillow + stdlib)
-        run: pip install pillow==10.4.0
+      - name: Install dependencies (pillow for data_prep; CPU torch +
+          numpy for build_cache, which imports train.py)
+        run: |
+          pip install pillow==10.4.0 numpy==1.26.4
+          pip install torch==2.3.1 --index-url https://download.pytorch.org/whl/cpu
 
       - name: Prepare Option C subset (40k train / 2k val, seed 42)
         run: python data_prep.py --train-limit 40000 --val-limit 2000
@@ -37,15 +45,43 @@ jobs:
           echo "val images:   $(ls data/images/val | wc -l)"
           cat data/manifest.json
 
+      - name: Build rasterized-mask cache (img 512)
+        run: |
+          python build_cache.py --data data --img 512 --workers 4
+          echo "train cache: $(ls data/cache-512/train | wc -l)"
+          echo "val cache:   $(ls data/cache-512/val | wc -l)"
+          du -sh data/cache-512
+
       - name: Pack and publish release data-coco-seg-40k
         run: |
           mkdir -p pack
           tar -cf - data | split -b 1900M - pack/data.tar.part-
           ls -la pack/
+          python - <<'PY'
+          import glob, hashlib, json, os
+          parts = []
+          for p in sorted(glob.glob("pack/data.tar.part-*")):
+              h = hashlib.md5()
+              with open(p, "rb") as f:
+                  for chunk in iter(lambda: f.read(1 << 22), b""):
+                      h.update(chunk)
+              parts.append({"name": os.path.basename(p),
+                            "bytes": os.path.getsize(p),
+                            "md5": h.hexdigest()})
+          with open("data/manifest.json") as f:
+              staged = json.load(f).get("staged")
+          with open("pack/pack-manifest.json", "w") as f:
+              json.dump({"parts": parts, "staged": staged,
+                         "includes": "images + polygon labels + "
+                                     "cache-512 rasterized masks"},
+                        f, indent=2)
+          print(json.dumps(parts, indent=2))
+          PY
           gh release view data-coco-seg-40k > /dev/null 2>&1 || \
             gh release create data-coco-seg-40k \
               --title "Object separator COCO subset (40k train / 2k val)" \
-              --notes "Class-agnostic COCO instance-seg subset pack for Colab Option C training: 40,000 train + 2,000 val images (seed 42, iscrowd excluded, labels dropped), images + polygon labels + manifest. Layout inside the tar: data/images/{train,val}/*.jpg, data/labels/{train,val}/*.json, data/manifest.json -- exactly what train.py --data expects. Built by .github/workflows/data-pack.yml."
+              --notes "Class-agnostic COCO instance-seg subset pack for Colab Option C training: 40,000 train + 2,000 val images (seed 42, iscrowd excluded, labels dropped), images + polygon labels + manifest + cache-512 pre-rasterized instance masks (build_cache.py). Layout inside the tar: data/images/{train,val}/*.jpg, data/labels/{train,val}/*.json, data/cache-512/{train,val}/*.npz, data/manifest.json -- exactly what train.py --data expects. pack-manifest.json lists each tar part's byte size + md5 for verified downloads. Built by .github/workflows/data-pack.yml."
           gh release upload data-coco-seg-40k pack/data.tar.part-* --clobber
           gh release upload data-coco-seg-40k data/manifest.json --clobber
+          gh release upload data-coco-seg-40k pack/pack-manifest.json --clobber
           echo "pack published"
