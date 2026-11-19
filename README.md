@@ -54,7 +54,7 @@ python data_prep.py --smoke         # stage the smoke subset
 python data_prep.py --full          # stage the full corpus
 ```
 
-## Smoke run (path verification, not accuracy)
+## Smoke run (path verification, not accuracy) — DONE 2026-11-19
 
 ```bash
 gh workflow run smoke.yml           # or the Actions tab
@@ -65,6 +65,34 @@ the chained-job checkpoint pattern), exports ONNX, and builds the
 layer-split demo on 5 val images: for each — `original.jpg`, `viz.jpg`
 (each object in a distinct colour) and `obj_NN.png` RGBA cutouts
 (the separate layers). Artifact: `object-separator-smoke`.
+
+**Measured results** — run
+[44503697787](https://github.com/bluu6964/object-separator/actions/runs/44503697787)
+(56 min, all steps green):
+
+| epoch | total loss | obj | box | iou | mask | val box mAP@0.5 | val mask mAP@0.5 |
+|---|---|---|---|---|---|---|---|
+| 1 | 50.60 | 1.804 | 22.63 | 2.388 | 1.144 | 0.0138 | 0.0050 |
+| 2 | 39.95 | 1.272 | 17.81 | 2.051 | 1.007 | 0.0168 | 0.0028 |
+| 3 (resumed) | 38.27 | 1.269 | 16.98 | 2.045 | 1.000 | 0.0174 | 0.0031 |
+| 4 | 34.82 | 1.131 | 15.41 | 1.882 | 0.994 | 0.0241 | 0.0060 |
+| 5 | 36.54 | 1.245 | 16.16 | 1.973 | 0.998 | 0.0185 | 0.0046 |
+
+- All losses finite; total loss fell 50.6 → ~35–37 (epoch 5 ticked up —
+  500-image smoke noise). Resume verified: run 2 logged
+  `Resumed from runs/last.pt: completed epochs=2`.
+- mAP is near zero, as expected: the smoke goal is path verification,
+  not accuracy. Best val mask mAP@0.5 = 0.0060 (epoch 4).
+- ONNX from the runner: **15,751,355 bytes**, loads in onnxruntime,
+  outputs `detections (8400, 37)` + `prototypes (32, 160, 160)`;
+  ~0.9 s/image inference on a 1.5-CPU shared VM (random input).
+- Layer-split demo produced for 5 val images (original + viz + RGBA
+  cutouts). At conf 0.25 the 5-epoch model over-fires (38–105
+  detections/image, masks still box-like) — an objectness-calibration
+  issue that only real training fixes, not a pipeline defect.
+- **Measured runner throughput: ~0.9 img/s train-only at 640×640,
+  batch 8 (≈ 8.9 s/step); eval ≈ 0.68 s/img.** This drives the
+  full-training estimate below.
 
 Local quick check (needs the CPU torch venv):
 
@@ -81,10 +109,30 @@ Same pattern as phone-detector v2: `data-pack.yml` builds the full
 dataset pack once (release `data-full`); `train.yml` restores
 `last.pt`/`best.pt` from release `ckpt-v1`, trains toward the TOTAL
 `--epochs` target, and uploads checkpoints back — re-dispatching
-continues the chain. `train.py --max-steps 300 --batch 8` is the timing
-probe used to size the chain. Measured smoke numbers and the resulting
-full-training estimate are recorded in the phase-1 report (and will be
-added here once the probe has run on a runner).
+continues the chain.
+
+### Time estimate (from the measured smoke throughput — an estimate)
+
+Assumptions: 0.9 img/s at 640×640 / batch 8 on the 4-core Actions
+runner (measured); 512×512 scales by (512/640)² ≈ 0.64 → ~1.4 img/s
+(compute-bound assumption, optimistic); one chained job ≈ 5.5 usable
+hours (340-min timeout); "days" = continuous back-to-back chaining,
+24 h/day. Steps/epoch at batch 8 = images ÷ 8 (full data: 14,658).
+
+| option | config | h/epoch | total | jobs | wall |
+|---|---|---|---|---|---|
+| A | 640px, full 117,266 imgs, 30 ep | ~36 | ~1,086 h | ~198 | ~45 days |
+| B | 512px, full data, 24 ep | ~23 | ~556 h | ~101 | ~23 days |
+| C ⭐ | 512px, 40k-image subset (~290k instances), 24 ep | ~7.9 | ~190 h | ~35 | ~8 days |
+| D | 640px, 40k subset, 24 ep | ~12.3 | ~296 h | ~54 | ~12 days |
+
+**Honest headline: at 640 px on free CPU runners, full-data training
+(option A) is not workable.** Option C is the recommended start: a
+40k-image subset still carries ~290k instance masks of supervision,
+and the chain can extend to more data/epochs later since checkpoints
+resume. Unmeasured headroom that could improve throughput 1.2–1.5×:
+`num_workers > 0`, batch 16, channels-last — worth a probe before the
+full run. Full training has NOT been started (phase-1 scope).
 
 ## Files
 

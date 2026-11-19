@@ -1,6 +1,7 @@
 data/
 data_src/
 runs/
+smoke-results/
 samples_in/
 samples_out/
 predictions/

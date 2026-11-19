@@ -98,7 +98,9 @@ def assemble(det, protos, conf, nms_thres):
         if x2 > x1 and y2 > y1:
             crop[y1:y2, x1:x2] = masks[n, y1:y2, x1:x2]
         masks[n] = crop
-    return boxes, scores, masks
+    # A "layer" with zero mask pixels is useless -- drop those detections.
+    nonempty = masks.reshape(len(masks), -1).any(axis=1)
+    return boxes[nonempty], scores[nonempty], masks[nonempty]
 
 
 def mask_to_original(mask_proto, scale, dx, dy, nw, nh, w0, h0):
