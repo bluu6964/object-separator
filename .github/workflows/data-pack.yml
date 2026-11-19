@@ -1,9 +1,11 @@
 name: data-pack-object-separator
 
-# One-time (per dataset version) job: builds the FULL class-agnostic COCO
-# dataset on the runner (118k images -- too slow to redo inside every
-# training job) and publishes it as split tar parts on release `data-full`,
-# the same pattern as phone-detector's data-v2 pack.
+# One-time (per dataset version) job: builds the Option C subset of the
+# class-agnostic COCO dataset on the runner (40,000 train + 2,000 val
+# images, fixed seed 42 -- see data_prep.py) and publishes it as split
+# tar parts on release `data-coco-seg-40k`, the same pattern as
+# phone-detector's data-v2 pack. The Colab notebook downloads this pack
+# instead of re-staging COCO inside every session.
 on:
   workflow_dispatch:
 
@@ -23,20 +25,27 @@ jobs:
           python-version: "3.11"
           cache: pip
 
-      - name: Install dependencies (data_prep needs only pillow/numpy-free stdlib + pillow)
+      - name: Install dependencies (data_prep needs only pillow + stdlib)
         run: pip install pillow==10.4.0
 
-      - name: Prepare FULL dataset (COCO, class-agnostic)
-        run: python data_prep.py --full
+      - name: Prepare Option C subset (40k train / 2k val, seed 42)
+        run: python data_prep.py --train-limit 40000 --val-limit 2000
 
-      - name: Pack and publish release data-full
+      - name: Verify staged counts
+        run: |
+          echo "train images: $(ls data/images/train | wc -l)"
+          echo "val images:   $(ls data/images/val | wc -l)"
+          cat data/manifest.json
+
+      - name: Pack and publish release data-coco-seg-40k
         run: |
           mkdir -p pack
           tar -cf - data | split -b 1900M - pack/data.tar.part-
           ls -la pack/
-          gh release view data-full > /dev/null 2>&1 || \
-            gh release create data-full --title "Object separator full dataset" \
-              --notes "Full class-agnostic COCO instance-seg pack (images + polygon labels + manifest). Built by .github/workflows/data-pack.yml."
-          gh release upload data-full pack/data.tar.part-* --clobber
-          gh release upload data-full data/manifest.json --clobber
+          gh release view data-coco-seg-40k > /dev/null 2>&1 || \
+            gh release create data-coco-seg-40k \
+              --title "Object separator COCO subset (40k train / 2k val)" \
+              --notes "Class-agnostic COCO instance-seg subset pack for Colab Option C training: 40,000 train + 2,000 val images (seed 42, iscrowd excluded, labels dropped), images + polygon labels + manifest. Layout inside the tar: data/images/{train,val}/*.jpg, data/labels/{train,val}/*.json, data/manifest.json -- exactly what train.py --data expects. Built by .github/workflows/data-pack.yml."
+          gh release upload data-coco-seg-40k pack/data.tar.part-* --clobber
+          gh release upload data-coco-seg-40k data/manifest.json --clobber
           echo "pack published"

@@ -8,17 +8,18 @@ The consumer thresholds, runs NMS on the boxes, then builds each mask
 as sigmoid(coeffs . prototypes) cropped to its box (see predict.py).
 Updates runs/metrics.json with the ONNX size.
 """
+import argparse
 import json
 import os
 
 import torch
 
+import model as model_mod
 from model import IMG_SIZE, PROTO_K, PROTO_SIZE, ExportWrapper, ObjectSeparator
-
-N_CELLS = sum((IMG_SIZE // s) ** 2 for s in (8, 16, 32))  # 8400
 
 
 def main(ckpt_path="runs/best.pt", out_dir="runs"):
+    n_cells = sum((IMG_SIZE // s) ** 2 for s in (8, 16, 32))  # 8400 @640
     model = ObjectSeparator()
     ckpt = torch.load(ckpt_path, map_location="cpu")
     model.load_state_dict(ckpt["model"])
@@ -46,7 +47,7 @@ def main(ckpt_path="runs/best.pt", out_dir="runs"):
         sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
         det, protos = sess.run(
             None, {"input": np.zeros((1, 3, IMG_SIZE, IMG_SIZE), dtype=np.float32)})
-        assert det.shape == (N_CELLS, 5 + PROTO_K), det.shape
+        assert det.shape == (n_cells, 5 + PROTO_K), det.shape
         assert protos.shape == (PROTO_K, PROTO_SIZE, PROTO_SIZE), protos.shape
         print(f"ONNX check OK: detections {det.shape}, prototypes {protos.shape}")
     except Exception as e:  # noqa: BLE001
@@ -63,4 +64,15 @@ def main(ckpt_path="runs/best.pt", out_dir="runs"):
 
 
 if __name__ == "__main__":
-    main()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--ckpt", default="runs/best.pt")
+    ap.add_argument("--out", default="runs")
+    ap.add_argument("--img", type=int, default=640,
+                    help="input size the checkpoint was trained at")
+    a = ap.parse_args()
+    if a.img != 640:
+        model_mod.set_img_size(a.img)
+        # Re-read the moved constants into this module's globals.
+        globals()["IMG_SIZE"] = model_mod.IMG_SIZE
+        globals()["PROTO_SIZE"] = model_mod.PROTO_SIZE
+    main(a.ckpt, a.out)

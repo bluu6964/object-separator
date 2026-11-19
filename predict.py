@@ -19,6 +19,7 @@ import os
 import numpy as np
 from PIL import Image
 
+import model as model_mod
 from evaluate import nms
 from model import IMG_SIZE, PROTO_K, PROTO_SIZE
 
@@ -128,7 +129,13 @@ def main():
     ap.add_argument("--out", default="predictions")
     ap.add_argument("--conf", type=float, default=0.30)
     ap.add_argument("--nms", type=float, default=0.5)
+    ap.add_argument("--img", type=int, default=640,
+                    help="input size the model was trained/exported at")
     args = ap.parse_args()
+    if args.img != 640:
+        model_mod.set_img_size(args.img)
+        globals()["IMG_SIZE"] = model_mod.IMG_SIZE
+        globals()["PROTO_SIZE"] = model_mod.PROTO_SIZE
 
     os.makedirs(args.out, exist_ok=True)
     use_onnx = args.model.endswith(".onnx")
@@ -139,7 +146,7 @@ def main():
         path = os.path.join(args.src, name)
         img = Image.open(path).convert("RGB")
         w0, h0 = img.size
-        canvas, scale, dx, dy, nw, nh = letterbox_image(img)
+        canvas, scale, dx, dy, nw, nh = letterbox_image(img, size=IMG_SIZE)
         arr = np.asarray(canvas, dtype=np.float32) / 255.0
         det, protos = (predict_onnx(args.model, arr) if use_onnx
                        else predict_torch(args.model, arr))

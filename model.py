@@ -28,6 +28,17 @@ PROTO_SIZE = IMG_SIZE // 4   # 160
 WIDTH = 3.125
 
 
+def set_img_size(n):
+    """Switch the working input size (default 640; Colab Option C uses
+    512). The network itself is fully convolutional -- this only moves
+    the module-level constants the dataset / target builder / decode /
+    export sizing read at runtime (prototypes stay at 1/4 input res).
+    Call BEFORE building datasets or exporting."""
+    global IMG_SIZE, PROTO_SIZE
+    IMG_SIZE = int(n)
+    PROTO_SIZE = IMG_SIZE // 4
+
+
 def _c(ch, w=WIDTH):
     """Scale a base channel count by the width multiplier (multiple of 8)."""
     return max(8, int(round(ch * w / 8.0)) * 8)

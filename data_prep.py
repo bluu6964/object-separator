@@ -14,6 +14,12 @@ Usage:
   python data_prep.py --counts-only   # verify corpus counts from the JSONs
   python data_prep.py --smoke         # stage 500 train / 100 val images
   python data_prep.py --full          # stage the full corpus
+  python data_prep.py --train-limit 40000 --val-limit 2000
+                                      # stage a fixed-seed subset (the
+                                      # Colab Option C pack)
+Subset selection is the same seeded shuffle as --smoke/--full (sorted
+image ids, random.Random(42).shuffle), so a subset is always a prefix
+of the full staging order.
 """
 import argparse
 import json
@@ -134,6 +140,11 @@ def main():
     ap.add_argument("--out", default="data")
     ap.add_argument("--smoke", action="store_true")
     ap.add_argument("--full", action="store_true")
+    ap.add_argument("--train-limit", type=int, default=None,
+                    help="stage only the first N train images (seeded "
+                         "shuffle order); combine with --val-limit")
+    ap.add_argument("--val-limit", type=int, default=None,
+                    help="stage only the first N val images")
     ap.add_argument("--counts-only", action="store_true")
     args = ap.parse_args()
 
@@ -150,17 +161,26 @@ def main():
     if args.counts_only:
         print(json.dumps(manifest["full"], indent=2))
         return
-    if not (args.smoke or args.full):
-        print("Pass --smoke or --full (or --counts-only).", file=sys.stderr)
+    if not (args.smoke or args.full
+            or args.train_limit is not None or args.val_limit is not None):
+        print("Pass --smoke, --full or --train-limit/--val-limit "
+              "(or --counts-only).", file=sys.stderr)
         return
 
     staged = {}
     if args.smoke:
         staged["train"] = stage_split("train", *splits["train"], args.out, SMOKE_TRAIN)
         staged["val"] = stage_split("val", *splits["val"], args.out, SMOKE_VAL)
-    else:
+    elif args.full:
         staged["train"] = stage_split("train", *splits["train"], args.out, None)
         staged["val"] = stage_split("val", *splits["val"], args.out, None)
+    else:
+        staged["train"] = stage_split("train", *splits["train"], args.out,
+                                       args.train_limit)
+        staged["val"] = stage_split("val", *splits["val"], args.out,
+                                     args.val_limit)
+        manifest["subset"] = {"train_limit": args.train_limit,
+                              "val_limit": args.val_limit, "seed": SEED}
     manifest["staged"] = staged
     os.makedirs(args.out, exist_ok=True)
     with open(os.path.join(args.out, "manifest.json"), "w") as f:

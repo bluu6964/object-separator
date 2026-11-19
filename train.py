@@ -32,6 +32,8 @@ import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageEnhance
 from torch.utils.data import DataLoader, Dataset
 
+import evaluate as evaluate_mod
+import model as model_mod
 from evaluate import evaluate_maps
 from model import (IMG_SIZE, PROTO_K, PROTO_SIZE, STRIDES, ObjectSeparator,
                    count_parameters)
@@ -40,7 +42,9 @@ PAD_VALUE = 114
 MASK_CELLS_PER_INST = 4
 
 
-def letterbox_params(w, h, size=IMG_SIZE):
+def letterbox_params(w, h, size=None):
+    if size is None:
+        size = IMG_SIZE  # read at call time so --img can move it
     scale = min(size / w, size / h)
     nw, nh = max(1, round(w * scale)), max(1, round(h * scale))
     dx, dy = (size - nw) // 2, (size - nh) // 2
@@ -296,28 +300,56 @@ def compute_loss(outputs, protos, targets, boxes_list, masks_list):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default="data")
-    ap.add_argument("--out", default="runs")
+    ap.add_argument("--out", "--ckpt-dir", dest="out", default="runs",
+                    help="checkpoint dir (last.pt / best.pt / metrics.json)")
     ap.add_argument("--epochs", type=int, default=30)
-    ap.add_argument("--batch", type=int, default=8)
+    ap.add_argument("--img", type=int, default=640,
+                    help="square input size (640 = original; Colab "
+                         "Option C uses 512)")
+    ap.add_argument("--batch", type=int, default=None,
+                    help="batch size; default resolves to 32 on CUDA "
+                         "(T4-16GB-safe at 512px with AMP) and 8 on CPU")
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--workers", type=int, default=2)
     ap.add_argument("--limit-train", type=int, default=None)
     ap.add_argument("--eval-limit", type=int, default=128)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--no-amp", action="store_true",
+                    help="disable mixed precision on CUDA (AMP is on by "
+                         "default whenever CUDA is available)")
     ap.add_argument("--resume", action="store_true",
                     help="resume from <out>/last.pt if it exists; --epochs "
                          "is the TOTAL target epoch count")
     ap.add_argument("--max-steps", type=int, default=None,
                     help="stop after N optimizer steps (timing probe mode; "
                          "no checkpoints or metrics are written)")
-    ap.add_argument("--save-every-min", type=float, default=30.0,
-                    help="also save last.pt at least this often (wall time)")
+    ap.add_argument("--save-every-min", type=float, default=25.0,
+                    help="also save last.pt at least this often (wall "
+                         "time) -- Colab sessions die without warning, "
+                         "so checkpoints must not wait for epoch end")
     args = ap.parse_args()
+
+    # Move the size constants everywhere they are read (model globals,
+    # this module's globals, evaluate's globals) BEFORE any dataset or
+    # target is built.
+    model_mod.set_img_size(args.img)
+    globals()["IMG_SIZE"] = model_mod.IMG_SIZE
+    globals()["PROTO_SIZE"] = model_mod.PROTO_SIZE
+    evaluate_mod.IMG_SIZE = model_mod.IMG_SIZE
+    evaluate_mod.PROTO_SIZE = model_mod.PROTO_SIZE
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
     np.random.seed(args.seed)
-    device = torch.device("cpu")
+    use_cuda = torch.cuda.is_available()
+    device = torch.device("cuda" if use_cuda else "cpu")
+    use_amp = use_cuda and not args.no_amp
+    if args.batch is None:
+        args.batch = 32 if use_cuda else 8
+    print(f"Device: {device}"
+          + (f" ({torch.cuda.get_device_name(0)})" if use_cuda else "")
+          + f"  AMP: {use_amp}  img: {args.img}  batch: {args.batch}",
+          flush=True)
     os.makedirs(args.out, exist_ok=True)
 
     model = ObjectSeparator()
@@ -325,6 +357,10 @@ def main():
     print(f"Parameters: {n_params:,} ({n_params / 1e6:.3f}M)", flush=True)
     if not (3_000_000 <= n_params <= 5_000_000):
         print("WARNING: parameter count outside 3M-5M target", flush=True)
+    if use_cuda:
+        model = model.to(device, memory_format=torch.channels_last)
+    else:
+        model = model.to(device)
 
     train_ds = SegDataset(args.data, "train", augment=True,
                           limit=args.limit_train, seed=args.seed)
@@ -332,11 +368,15 @@ def main():
     print(f"Train images: {len(train_ds)}  Val images: {len(val_ds)}", flush=True)
     loader = DataLoader(train_ds, batch_size=args.batch, shuffle=True,
                         num_workers=args.workers, collate_fn=collate,
-                        drop_last=False)
+                        pin_memory=use_cuda, drop_last=False)
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=5e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(
         opt, T_max=max(1, args.epochs))
+    try:
+        scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    except (AttributeError, TypeError):  # older torch
+        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     start_epoch = 0
     best_map = -1.0
@@ -352,6 +392,11 @@ def main():
         else:
             for _ in range(int(ckpt.get("epoch", 0))):
                 sched.step()
+        if "scaler" in ckpt:
+            try:
+                scaler.load_state_dict(ckpt["scaler"])
+            except Exception as e:  # noqa: BLE001 -- scaler state is
+                print(f"  (scaler state not restored: {e})", flush=True)
         start_epoch = int(ckpt.get("epoch", 0))
         best_map = float(ckpt.get("best_map", -1.0))
         history = ckpt.get("history", [])
@@ -363,10 +408,17 @@ def main():
         return
 
     def save_last(completed_epochs, val_mask_map):
+        # Write to a temp file then rename: if the session dies mid-save
+        # (Colab!), the previous last.pt stays intact and resumable.
+        tmp_path = last_path + ".tmp"
         torch.save({"model": model.state_dict(), "opt": opt.state_dict(),
-                    "sched": sched.state_dict(), "epoch": completed_epochs,
+                    "sched": sched.state_dict(),
+                    "scaler": scaler.state_dict(),
+                    "epoch": completed_epochs,
                     "val_mask_map50": val_mask_map, "best_map": best_map,
-                    "params": n_params, "history": history}, last_path)
+                    "params": n_params, "img": args.img,
+                    "history": history}, tmp_path)
+        os.replace(tmp_path, last_path)
 
     def write_metrics(final=None):
         metrics = {"params": n_params, "params_m": round(n_params / 1e6, 3),
@@ -388,15 +440,22 @@ def main():
         steps = 0
         imgs_seen = 0
         for imgs, boxes, masks in loader:
-            imgs = imgs.to(device)
+            if use_cuda:
+                imgs = imgs.to(device, non_blocking=True,
+                               memory_format=torch.channels_last)
+            else:
+                imgs = imgs.to(device)
             targets = build_targets(boxes, device)
-            outs, protos = model(imgs)
-            loss, lo, lb, li, lm, _ = compute_loss(
-                outs, protos, targets, boxes, masks)
-            opt.zero_grad()
-            loss.backward()
+            with torch.autocast(device_type=device.type, enabled=use_amp):
+                outs, protos = model(imgs)
+                loss, lo, lb, li, lm, _ = compute_loss(
+                    outs, protos, targets, boxes, masks)
+            opt.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
-            opt.step()
+            scaler.step(opt)
+            scaler.update()
             for j, v in enumerate((loss, lo, lb, li, lm)):
                 run[j] += float(v)
             steps += 1
